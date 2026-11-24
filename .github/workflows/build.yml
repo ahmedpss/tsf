@@ -1,0 +1,64 @@
+name: Build Daftara APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor plugins and web assets
+        run: npx cap sync android
+
+      - name: Ensure Android camera permission
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          permission = '<uses-permission android:name="android.permission.CAMERA" />'
+          if 'android.permission.CAMERA' not in s:
+              s = s.replace('<application', permission + '\n    <application', 1)
+          p.write_text(s)
+          PY
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Daftara-Cashier-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
