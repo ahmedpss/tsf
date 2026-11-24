@@ -1,0 +1,1 @@
+window.CASHIER_CONFIG = {"supabaseUrl":"https://daftara-daftara.areflh.easypanel.host","supabaseAnonKey":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzkzMzMyNTk3LCJleHAiOjIxMDg5NTE3OTd9.EOxYWi3P8LAZkEhwzyX8BSLKKE2IM3p7aERVV_4kD6w","flavor":"direct","version":"1.6.2","release":true,"build":89};
