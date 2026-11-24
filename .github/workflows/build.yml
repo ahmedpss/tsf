@@ -1,5 +1,5 @@
 
-name: Build Daftara Cashier APK
+name: Build Daftara APK
 
 on:
   workflow_dispatch:
@@ -27,20 +27,39 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '21'
 
       - name: Install dependencies
         run: npm install
 
-      - name: Build Android APK
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Ensure camera permission
         run: |
-          npx cap sync android
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          permission = '<uses-permission android:name="android.permission.CAMERA" />'
+          if 'android.permission.CAMERA' not in s:
+              s = s.replace('<application', permission + '\n    <application', 1)
+          p.write_text(s)
+          PY
+
+      - name: Build APK
+        run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: daftara-cashier-apk
+          name: Daftara-Cashier-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
