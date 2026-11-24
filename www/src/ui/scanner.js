@@ -1,0 +1,386 @@
+// الماسح: كاميرا مستمرة بـ Google ML Kit (عبر خدمات Google Play، فلا يكبر التطبيق)، صوت واهتزاز لكل مسح،
+// زر الفلاش، وحقل لكتابة الباركود يدويًا دائمًا (كاميرا معطلة، باركود ممسوح، أو تجربة في المتصفح).
+//
+// على أندرويد تعمل الكاميرا خلف صفحة التطبيق: نجعل الصفحة شفافة في وسطها ونُظهر الإطار فوقها.
+// في المتصفح (نسخة الويب، آيفون): كاميرا الصفحة مع BarcodeDetector أو ZXing (ui/detector.js)، وإلا الكتابة اليدوية.
+import { h } from './dom.js';
+import { icon } from './icons.js';
+import { feedback } from './feedback.js';
+import { helpButton } from './components.js';
+import { normalizeBarcode } from '../domain/product.js';
+import { createDetector, cameraVideo, cameraStream } from './detector.js';
+
+const FORMATS = ['EAN_13', 'EAN_8', 'UPC_A', 'UPC_E', 'CODE_128', 'CODE_39', 'CODE_93', 'ITF', 'CODABAR'];
+// الباركود يُحسب مرة واحدة ما دام أمام الكاميرا. ليُحسب ثانية: أبعد الكاميرا عنه (ثانية ونصف) ثم امسحه من جديد،
+// أو زد العدد بزر + في السلة. (كل قراءة له تجدّد المهلة، فالبقاء أمامه لا يكرره أبدًا.)
+const REPEAT_MS = 1500;
+let active = null;
+
+// ---------- التكبير ----------
+// عدسات الجوالات الرخيصة لا تركّز على القريب (أقل من 10 سم تقريبًا، وبعضها تركيزه ثابت). الحل: تكبير 2×
+// افتراضيًا، فيمسك البائع الجوال على شبر (15–20 سم) حيث الصورة حادّة والباركود يملأ الإطار.
+// الاختيار (1× / 2× / 3×) يُحفظ لكل جوال.
+const ZOOM_KEY = 'cashier-zoom';
+const DEFAULT_ZOOM = 2;
+export const SCAN_HINT = 'أبعد الجوال شبرًا عن الباركود';
+
+function savedZoom() {
+  try { const z = Number(localStorage.getItem(ZOOM_KEY)); return z >= 1 && z <= 5 ? z : DEFAULT_ZOOM; } catch { return DEFAULT_ZOOM; }
+}
+
+/** أقرب مستوى مسموح للمطلوب ضمن حدود الكاميرا (نقي، للاختبار). */
+export function pickZoom(wanted, min, max) {
+  const lo = Number.isFinite(min) && min > 0 ? min : 1;
+  const hi = Number.isFinite(max) && max >= lo ? max : lo;
+  return Math.min(Math.max(wanted, Math.max(1, lo)), hi);
+}
+
+/** المستويات المعروضة: 1× و2× و3× إن كانت الكاميرا تسمح بها. */
+export function zoomLevels(min, max) {
+  return [1, 2, 3].filter((z) => z >= (min || 1) - 0.01 && z <= (max || 1) + 0.01);
+}
+
+/** يطبّق التكبير المحفوظ ويرجع شريط أزرار التكبير (أو null إن لم تدعمه الكاميرا). */
+async function setupZoom(native) {
+  let min = 1, max = 1;
+  try { min = (await native.getMinZoomRatio()).zoomRatio; max = (await native.getMaxZoomRatio()).zoomRatio; } catch { return null; }
+  const levels = zoomLevels(min, max);
+  if (levels.length < 2) return null;
+  let current = pickZoom(savedZoom(), min, max);
+  const bar = h('div', { class: 'zoom-bar', role: 'group', 'aria-label': 'التكبير' });
+  const apply = async (z) => {
+    current = z;
+    try { await native.setZoomRatio({ zoomRatio: z }); } catch { /* */ }
+    try { localStorage.setItem(ZOOM_KEY, String(z)); } catch { /* */ }
+    paint();
+  };
+  const paint = () => {
+    bar.textContent = '';
+    for (const z of levels) bar.append(h('button', { class: `zoom-btn ${Math.abs(current - z) < 0.01 ? 'on' : ''}`, type: 'button', 'aria-label': `تكبير ${z}`, onclick: (e) => { e.stopPropagation(); apply(z); } }, `${z}×`));
+  };
+  try { await native.setZoomRatio({ zoomRatio: current }); } catch { /* */ }
+  paint();
+  return bar;
+}
+
+function plugin() {
+  return globalThis.Capacitor?.isNativePlatform?.() ? globalThis.Capacitor.Plugins.BarcodeScanner : null;
+}
+
+/**
+ * يفتح الماسح. onCode(code) يُستدعى لكل باركود جديد؛ إن أرجع وعدًا يتوقف المسح حتى ينتهي
+ * (مثلًا ورقة إضافة صنف جديد)، ثم يعود وحده. continuous=false: يُغلق بعد أول باركود.
+ * panel: عنصر اختياري يظهر أسفل الإطار (عدّاد، آخر صنف…).
+ */
+export function openScanner({ title = 'امسح الباركود', onCode, continuous = true, panel = null, onClose = null } = {}) {
+  if (active) active.close();
+  const native = plugin();
+  let paused = false;
+  let closed = false;
+  let last = { code: '', at: 0 };
+  let video = null;
+  let stream = null;
+  let detectTimer = null;
+  const listeners = [];
+
+  const status = h('div', { class: 'scan-status' });
+  const manual = h('input', {
+    class: 'input scan-manual-input', type: 'text', inputmode: 'numeric', dir: 'ltr', autocomplete: 'off',
+    placeholder: 'أو اكتب الباركود هنا', enterkeyhint: 'done', 'aria-label': 'اكتب الباركود',
+  });
+  const torchBtn = h('button', { class: 'icon-btn scan-torch', type: 'button', 'aria-label': 'الفلاش', onclick: toggleTorch, hidden: true }, icon('flash'));
+  const frame = h('div', { class: 'scan-frame' }, h('span', { class: 'scan-laser' }));
+  // التقاط باركود واحد إضافي والماسح متوقف على ورقة مفتوحة (باركود القطعة المنفردة بعد مسح كرتونتها)
+  let captureFn = null;
+  const cancelCapture = h('button', { class: 'btn btn-outline btn-block', type: 'button', hidden: true, onclick: () => captureFn && captureFn(null) }, 'إلغاء — رجوع للصنف');
+  const ui = h('div', { class: 'scanner', role: 'dialog', 'aria-label': title },
+    h('div', { class: 'scan-top' },
+      h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'إغلاق', onclick: () => ctl.close() }, icon('x')),
+      h('div', { class: 'scan-title' }, title),
+      torchBtn,
+      helpButton({ compact: true, dark: true }),
+    ),
+    frame,
+    status,
+    h('div', { class: 'scan-bottom' },
+      h('form', { class: 'scan-manual', onsubmit: (e) => { e.preventDefault(); const v = manual.value; manual.value = ''; handle(v, true); } },
+        manual, h('button', { class: 'btn btn-primary', type: 'submit' }, icon('check', 20), h('span', null, 'تم'))),
+      cancelCapture,
+      panel,
+    ),
+  );
+
+  function say(text, kind = '') {
+    status.textContent = text || '';
+    status.className = `scan-status ${kind}`;
+  }
+
+  async function handle(raw, typed = false) {
+    if (closed) return;
+    if (captureFn) {
+      const c = normalizeBarcode(raw);
+      if (!c) return;
+      feedback.ok();
+      flash();
+      captureFn(c);
+      return;
+    }
+    if (paused) return;
+    const code = normalizeBarcode(raw);
+    if (!code) return;
+    const now = Date.now();
+    if (!typed && code === last.code && now - last.at < REPEAT_MS) { last.at = now; return; }
+    last = { code, at: now };
+    feedback.ok();
+    flash();
+    if (!continuous) { if (onCode) onCode(code); ctl.close(); return; }
+    const r = onCode && onCode(code);
+    if (r && typeof r.then === 'function') {
+      paused = true;
+      try { await r; } finally { paused = false; last = { code, at: Date.now() }; }
+    }
+  }
+
+  function flash() {
+    frame.classList.remove('hit');
+    void frame.offsetWidth;
+    frame.classList.add('hit');
+  }
+
+  async function toggleTorch() {
+    try { await native.toggleTorch(); torchBtn.classList.toggle('on'); } catch { /* بلا فلاش */ }
+  }
+
+  async function startNative() {
+    try {
+      const perm = await native.requestPermissions();
+      if (perm.camera !== 'granted' && perm.camera !== 'limited') {
+        say('اسمح للتطبيق باستخدام الكاميرا من إعدادات الجوال، أو اكتب الباركود.', 'warn');
+        feedback.error();
+        return;
+      }
+      document.documentElement.classList.add('scanning');
+      listeners.push(await native.addListener('barcodesScanned', (e) => {
+        const b = e.barcodes && e.barcodes[0];
+        if (b) handle(b.rawValue || b.displayValue);
+      }));
+      listeners.push(await native.addListener('scanError', () => say('تعذّرت قراءة الكاميرا، حاول مجددًا', 'warn')));
+      await native.startScan({ formats: FORMATS, lensFacing: 'BACK' });
+      if (closed) { native.stopScan(); return; }
+      try { torchBtn.hidden = !(await native.isTorchAvailable()).available; } catch { /* */ }
+      const zoom = await setupZoom(native);
+      if (zoom) frame.after(zoom);
+      say(SCAN_HINT);
+    } catch (e) {
+      document.documentElement.classList.remove('scanning');
+      say('الماسح يتجهّز لأول مرة (يحتاج إنترنت مرة واحدة). اكتب الباركود الآن.', 'warn');
+      console.warn('scanner', e);
+    }
+  }
+
+  async function startWeb() {
+    const desktop = (globalThis.CASHIER_CONFIG || {}).flavor === 'desktop';
+    if (desktop || !navigator.mediaDevices?.getUserMedia) {
+      say(desktop ? 'امسح بقارئ الباركود أو اكتبه هنا' : 'اكتب الباركود (الكاميرا تحتاج متصفحًا حديثًا)');
+      setTimeout(() => manual.focus(), 100);
+      return;
+    }
+    try {
+      say('الكاميرا تفتح…');
+      stream = await cameraStream();
+      if (closed) { stream.getTracks().forEach((t) => t.stop()); return; }
+      video = cameraVideo('scan-video');
+      video.srcObject = stream;
+      ui.prepend(video);
+      video.play().catch(() => {});
+      const det = await createDetector();
+      if (closed) return;
+      if (!det) { say('تعذّرت قراءة الباركود بهذا المتصفح. اكتبه هنا.', 'warn'); return; }
+      let busy = false;
+      detectTimer = setInterval(async () => {
+        if (busy || (paused && !captureFn) || video.readyState < 2) return;
+        busy = true;
+        try { const r = await det.detect(video); if (r[0]) handle(r[0]); } catch { /* إطار غير جاهز */ } finally { busy = false; }
+      }, 200);
+      say('وجّه الكاميرا نحو الباركود');
+    } catch {
+      say('لا يمكن فتح الكاميرا: اسمح للموقع باستخدامها، أو اكتب الباركود.', 'warn');
+    }
+  }
+
+  const ctl = {
+    el: ui,
+    pause() { paused = true; },
+    resume() { paused = false; },
+    /** يحرّر الكاميرا مؤقتًا (لالتقاط صورة للصنف بكاميرا الجوال) ثم يعيدها. */
+    async suspendCamera() {
+      paused = true;
+      if (native) {
+        document.documentElement.classList.remove('scanning');
+        try { await native.stopScan(); } catch { /* */ }
+      }
+    },
+    async resumeCamera() {
+      if (closed) return;
+      if (native) {
+        try {
+          await native.startScan({ formats: FORMATS, lensFacing: 'BACK' });
+          document.documentElement.classList.add('scanning');
+          await native.setZoomRatio({ zoomRatio: savedZoom() });
+        } catch { /* */ }
+      }
+      paused = false;
+    },
+    say,
+    /** يلتقط الباركود التالي فقط (حتى والماسح متوقف) ويرجعه، أو null إن أُلغي. */
+    capture(text) {
+      if (closed) return Promise.resolve(null);
+      if (captureFn) captureFn(null);
+      return new Promise((resolve) => {
+        say(text, 'ok');
+        cancelCapture.hidden = false;
+        if (panel) panel.hidden = true;
+        captureFn = (code) => {
+          captureFn = null;
+          cancelCapture.hidden = true;
+          if (panel) panel.hidden = false;
+          say('');
+          resolve(code);
+        };
+      });
+    },
+    close() {
+      if (closed) return;
+      if (captureFn) captureFn(null);
+      closed = true;
+      active = null;
+      document.documentElement.classList.remove('scanning');
+      if (native) {
+        for (const l of listeners) { try { l.remove(); } catch { /* */ } }
+        native.stopScan().catch(() => {});
+      }
+      if (detectTimer) clearInterval(detectTimer);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      ui.remove();
+      if (onClose) onClose();
+    },
+  };
+
+  document.body.append(ui);
+  active = ctl;
+  if (native) startNative(); else startWeb();
+  return ctl;
+}
+
+/** لزر الرجوع: يغلق الماسح إن كان مفتوحًا. */
+export function closeScanner() {
+  if (!active) return false;
+  active.close();
+  return true;
+}
+
+export function scannerOpen() {
+  return !!active;
+}
+
+/** مسح باركود واحد (للبحث أو لحقل الباركود). يرجع الكود أو null إن أُغلق. */
+export function scanOnce(title = 'امسح الباركود') {
+  return new Promise((resolve) => {
+    let got = null;
+    openScanner({ title, continuous: false, onCode: (c) => { got = c; }, onClose: () => resolve(got) });
+  });
+}
+
+
+/**
+ * مسح داخل الشاشة (شاشة البيع): الكاميرا تظهر في مربع box والسلة ظاهرة تحته.
+ * على أندرويد المعاينة خلف الصفحة: نجعل الصفحة شفافة ونُبقي باقي العناصر بخلفيات معتمة.
+ * يرجع { stop, pause, resume, toggleTorch, torch: boolean } أو null إن لم تتوفر كاميرا.
+ */
+export async function startInlineScanner({ box, onCode, onStatus = () => {} }) {
+  const native = plugin();
+  let paused = false;
+  let stopped = false;
+  let last = { code: '', at: 0 };
+  const listeners = [];
+  let stream = null;
+  let timer = null;
+  let overlay = null;
+
+  function handle(raw) {
+    if (stopped || paused) return;
+    const code = normalizeBarcode(raw);
+    if (!code) return;
+    const now = Date.now();
+    if (code === last.code && now - last.at < REPEAT_MS) { last.at = now; return; }
+    last = { code, at: now };
+    feedback.ok();
+    box.classList.remove('hit'); void box.offsetWidth; box.classList.add('hit');
+    onCode(code);
+  }
+
+  const ctl = {
+    torch: false,
+    pause() { paused = true; },
+    resume() { paused = false; },
+    async toggleTorch() { if (native) { try { await native.toggleTorch(); } catch { /* */ } } },
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      document.documentElement.classList.remove('scanning-inline');
+      if (native) {
+        for (const l of listeners) { try { l.remove(); } catch { /* */ } }
+        try { await native.stopScan(); } catch { /* */ }
+      }
+      if (timer) clearInterval(timer);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      box.querySelector('video')?.remove();
+      if (overlay) { overlay.remove(); overlay = null; }
+    },
+  };
+
+  if (native) {
+    try {
+      const perm = await native.requestPermissions();
+      if (perm.camera !== 'granted' && perm.camera !== 'limited') { onStatus('اسمح باستخدام الكاميرا من إعدادات الجوال'); return null; }
+      listeners.push(await native.addListener('barcodesScanned', (e) => { const b = e.barcodes && e.barcodes[0]; if (b) handle(b.rawValue || b.displayValue); }));
+      document.documentElement.classList.add('scanning-inline');
+      await native.startScan({ formats: FORMATS, lensFacing: 'BACK' });
+      try { ctl.torch = (await native.isTorchAvailable()).available; } catch { /* */ }
+      const zoom = await setupZoom(native);
+      overlay = h('div', { class: 'cam-overlay' }, h('span', { class: 'cam-hint' }, SCAN_HINT), zoom);
+      box.append(overlay);
+      onStatus('');
+      return ctl;
+    } catch (e) {
+      await ctl.stop();
+      onStatus('الماسح يتجهّز لأول مرة (يحتاج إنترنت مرة واحدة). ابحث بالاسم أو اكتب الباركود.');
+      return null;
+    }
+  }
+  const desktop = (globalThis.CASHIER_CONFIG || {}).flavor === 'desktop';
+  if (desktop || !navigator.mediaDevices?.getUserMedia) { onStatus(desktop ? '' : 'ابحث بالاسم أو اكتب الباركود'); return null; }
+  try {
+    stream = await cameraStream();
+    if (stopped) { stream.getTracks().forEach((t) => t.stop()); return null; }
+    const video = cameraVideo('scan-video');
+    video.srcObject = stream;
+    box.prepend(video);
+    video.play().catch(() => {});
+    const det = await createDetector();
+    if (!det) { await ctl.stop(); onStatus('تعذّرت قراءة الباركود بهذا المتصفح — ابحث بالاسم أو اكتب الباركود'); return null; }
+    let busy = false;
+    timer = setInterval(async () => {
+      if (busy || paused || stopped || video.readyState < 2) return;
+      busy = true;
+      try { const r = await det.detect(video); if (r[0]) handle(r[0]); } catch { /* */ } finally { busy = false; }
+    }, 200);
+    overlay = h('div', { class: 'cam-overlay' }, h('span', { class: 'cam-hint' }, 'وجّه الكاميرا نحو الباركود'));
+    box.append(overlay);
+    return ctl;
+  } catch {
+    await ctl.stop();
+    onStatus('لا يمكن فتح الكاميرا: اسمح للموقع باستخدامها — أو ابحث بالاسم واكتب الباركود');
+    return null;
+  }
+}
